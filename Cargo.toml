@@ -36,6 +36,7 @@ num-complex = "0.4"
 cubecl-matmul = "0.8.1"
 cubecl-core = "0.8.1"
 cubecl-std = "0.8.1"
+nalgebra = "0.32"
 
 [features]
 default = ["cpu-backend"]
@@ -45,3 +46,5 @@ cubecl-kernels = []
 logging = ["env_logger"]
 
 [dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

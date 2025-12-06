@@ -2,8 +2,9 @@ mod error;
 mod kernels;
 mod memory;
 mod runtime;
-mod traits;
+pub mod traits;
 mod types;
+pub mod fock;
 
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use crate::backend::traits::{Backend, BackendFft, BackendLinalg, BackendReduce};
 pub use crate::backend::types::*;
 #[allow(unused_imports)]
 pub use crate::backend::traits::*;
+pub use crate::backend::fock::FockWorkspace;
 
 /// Concrete backend wrapping a Cube runtime; composes linalg/fft/reduce/memory facades.
 pub struct CubeBackend {

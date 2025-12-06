@@ -26,6 +26,33 @@ pub enum Error {
     /// Internal bug or unexpected state.
     #[error("internal error: {0}")]
     InternalError(String),
+
+    /// SCF result was not converged when a follow-up workflow attempted to use it.
+    #[error("SCF not converged: {message}")]
+    ScfNotConverged { message: String },
+
+    /// Band-structure run was requested with no band k-points.
+    #[error("band-structure k-point path is empty")]
+    EmptyKPointPath,
+
+    /// Integral evaluation failed at a specific band k-point.
+    #[error("integral evaluation failed at k = {kpoint:?}: {message}")]
+    IntegralFailure {
+        kpoint: [f64; 3],
+        message: String,
+    },
+
+    /// Generalized eigenproblem failed while solving for band energies.
+    #[error("eigensolver failed: {message}")]
+    EigenFailure { message: String },
+
+    /// SCF method does not support band-structure evaluation.
+    #[error("method incompatible with band structure: {method}")]
+    IncompatibleMethod { method: String },
+
+    /// Feature exists in design but is not implemented yet.
+    #[error("feature not implemented: {feature}")]
+    NotImplemented { feature: String },
 }
 
 /// Detailed input and validation errors.

@@ -23,23 +23,26 @@
 //!     .with_kmesh(KMesh::new([2, 2, 2]))
 //!     .run();
 //!
-//! // BandStructureBuilder would use the SCF result when implemented
-//! let _bands = BandStructureBuilder::new(&cell, &scf.unwrap())
-//!     .run();
+//! // BandStructureBuilder produces band energies along a path; kernels are
+//! // currently placeholders that return zero-valued bands with correct shapes.
+//! let _bands = BandStructureBuilder::new(&cell, &scf.unwrap()).run();
 //! ```
 
 pub mod backend;
 pub mod band;
 pub mod cell;
 pub mod error;
+pub mod integrals;
 pub mod kpoints;
+pub mod linalg;
 pub mod scf;
 pub mod util;
 
 // Re-exports for ergonomic `use rustyscf::*;` patterns
 pub use crate::backend::{BackendConfig, BackendKind};
-pub use crate::band::{BandStructureBuilder, BandStructureResult};
+pub use crate::band::{BandLinalgBackend, BandStructure, BandStructureBuilder, BandStructureResult};
 pub use crate::cell::{Cell, CellBuilder, Unit};
 pub use crate::error::{Error, Result};
-pub use crate::kpoints::{KMesh, KPath, KPoint};
+pub use crate::kpoints::{KMesh, KPath, KPathSegment, KPoint};
+pub use crate::linalg::{CpuEigenSolver, CubeclEigenSolver, Matrix};
 pub use crate::scf::{Method, ScfBuilder, ScfResult};

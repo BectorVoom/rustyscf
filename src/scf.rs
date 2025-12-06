@@ -1,8 +1,11 @@
 use crate::backend::BackendConfig;
 use crate::backend::{BackendError, make_backend};
+use crate::backend::FockWorkspace;
 use crate::cell::Cell;
 use crate::error::{Error, Result};
-use crate::kpoints::KMesh;
+use crate::kpoints::{KMesh, KPoint};
+use crate::integrals::pbc::{CpuIntegralProvider, PbcIntegralProvider};
+use crate::linalg::Matrix;
 
 /// SCF methods supported in v0.1.0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,12 +22,52 @@ pub struct ScfBuilder<'a> {
     conv_tol: f64,
     max_cycle: usize,
     backend: BackendConfig,
+    integral_provider: Option<Box<dyn PbcIntegralProvider + Send + Sync + 'static>>,
 }
 
 /// Placeholder SCF result container.
-#[derive(Debug, Default)]
 pub struct ScfResult {
     pub converged: bool,
+    pub cell: Cell,
+    pub kmesh: KMesh,
+    pub kpoints: Vec<KPoint>,
+    pub density: DensityKpts,
+    pub nao: usize,
+    pub fermi_level: Option<f64>,
+    pub integral_provider: Box<dyn PbcIntegralProvider + Send + Sync + 'static>,
+}
+
+/// Minimal density matrix container on the SCF sampling k-mesh.
+#[derive(Debug, Default, Clone)]
+pub struct DensityKpts {
+    /// Density matrices flattened (k-major) for placeholder use.
+    pub dms: Vec<Vec<f64>>,
+    pub nao: usize,
+}
+
+impl DensityKpts {
+    pub fn zero(nao: usize, nkpts: usize) -> Self {
+        let dm_size = nao * nao;
+        let mut dms = Vec::with_capacity(nkpts);
+        for _ in 0..nkpts {
+            dms.push(vec![0.0; dm_size]);
+        }
+        Self { dms, nao }
+    }
+}
+
+/// Trait describing the data required by band-structure workflows.
+pub trait PeriodicScf {
+    fn cell(&self) -> &Cell;
+    fn kmesh(&self) -> &[KPoint];
+    fn density(&self) -> &DensityKpts;
+    fn fermi_level(&self) -> Option<f64>;
+    fn ao_dimension(&self) -> usize;
+    fn converged(&self) -> bool;
+    fn integral_provider(&self) -> &dyn PbcIntegralProvider;
+
+    /// Build Fock and overlap matrices at an arbitrary band k-point.
+    fn build_fock_at_k(&self, k_band: &KPoint) -> Result<(Matrix, Matrix)>;
 }
 
 impl<'a> ScfBuilder<'a> {
@@ -36,6 +79,7 @@ impl<'a> ScfBuilder<'a> {
             conv_tol: 1e-8,
             max_cycle: 10,
             backend: BackendConfig::cpu(),
+            integral_provider: None,
         }
     }
 
@@ -61,6 +105,14 @@ impl<'a> ScfBuilder<'a> {
 
     pub fn with_backend(mut self, backend: BackendConfig) -> Self {
         self.backend = backend;
+        self
+    }
+
+    pub fn with_integral_provider(
+        mut self,
+        provider: Box<dyn PbcIntegralProvider + Send + Sync + 'static>,
+    ) -> Self {
+        self.integral_provider = Some(provider);
         self
     }
 
@@ -108,13 +160,45 @@ impl<'a> ScfBuilder<'a> {
 
         // Construct backend; execute a minimal backend op to validate wiring.
         let backend = make_backend(&self.backend).map_err(Error::from)?;
+        // Basic backend smoke test: sum over zero buffer and run placeholder J skeleton.
         let buf = backend
             .alloc_f64(1, crate::backend::MemoryUsage::Transient)
             .map_err(Error::from)?;
-        // Sum should return 0.0 for zero-initialised buffer on CPU; on WGPU this
-        // will currently return a kernel failure until kernels are wired.
         let _ = backend.sum_f64(&buf, 1).map_err(Error::from)?;
         backend.free_f64(buf).map_err(Error::from)?;
+
+        // Placeholder J-build skeleton on a tiny grid to validate FFT plumbing.
+        let grid = [2, 2, 2];
+        let ngrid = grid.iter().product();
+        let mut workspace = FockWorkspace::new(backend.as_ref(), ngrid).map_err(Error::from)?;
+        let coulomb = backend
+            .alloc_f64(ngrid, crate::backend::MemoryUsage::Transient)
+            .map_err(Error::from)?;
+        // fill v(G)=0 to keep it cheap
+        backend
+            .write_f64(&mut coulomb.clone(), &vec![0.0; ngrid])
+            .map_err(Error::from)?;
+        let mut j_mat = backend
+            .alloc_f64(1, crate::backend::MemoryUsage::Transient)
+            .map_err(Error::from)?;
+        backend
+            .write_f64(&mut j_mat, &[0.0])
+            .map_err(Error::from)?;
+        let j_handle = crate::backend::MatrixHandle::new(j_mat, 1, 1);
+        let _ = crate::backend::fock::build_j_skeleton(
+            backend.as_ref(),
+            grid,
+            &coulomb,
+            &mut workspace,
+            &mut [j_handle],
+            None,
+            None,
+        )
+        .map_err(|e| Error::ResourceError {
+            message: format!("J-build skeleton failed: {e:?}"),
+            requested_memory_mb: None,
+            limit_memory_mb: None,
+        })?;
 
         // Placeholder successful result for CPU path until kernels exist.
         let _ = (
@@ -126,9 +210,94 @@ impl<'a> ScfBuilder<'a> {
             self.backend,
         );
 
-        Ok(ScfResult { converged: true })
+        let nao = 1; // placeholder: single AO per cell for stub behavior
+        let kpoints = kmesh.generate_points();
+        let density = DensityKpts::zero(nao, kpoints.len());
+        let integral_provider: Box<dyn PbcIntegralProvider + Send + Sync> =
+            match self.integral_provider {
+                Some(p) => p,
+                None => Box::new(CpuIntegralProvider),
+            };
+
+        Ok(ScfResult {
+            converged: true,
+            cell: self.cell.clone(),
+            kmesh,
+            kpoints,
+            density,
+            nao,
+            fermi_level: Some(0.0),
+            integral_provider,
+        })
     }
 }
+
+impl PeriodicScf for ScfResult {
+    fn cell(&self) -> &Cell {
+        &self.cell
+    }
+
+    fn kmesh(&self) -> &[KPoint] {
+        &self.kpoints
+    }
+
+    fn density(&self) -> &DensityKpts {
+        &self.density
+    }
+
+    fn fermi_level(&self) -> Option<f64> {
+        self.fermi_level
+    }
+
+    fn ao_dimension(&self) -> usize {
+        self.nao
+    }
+
+    fn converged(&self) -> bool {
+        self.converged
+    }
+
+    fn integral_provider(&self) -> &dyn PbcIntegralProvider {
+        self.integral_provider.as_ref()
+    }
+
+    fn build_fock_at_k(&self, _k_band: &KPoint) -> Result<(Matrix, Matrix)> {
+        let nao = self.nao;
+        let overlap = self.integral_provider.overlap_at_k(&self.cell, _k_band, nao)?;
+        let kinetic = self.integral_provider.kinetic_at_k(&self.cell, _k_band, nao)?;
+        let v_nuc = self.integral_provider.v_nuc_at_k(&self.cell, _k_band, nao)?;
+        let (j, k) = self
+            .integral_provider
+            .j_k_at_k(&self.cell, &self.density, _k_band, nao)?;
+
+        // F = T + V_nuc + J - K  (DFT XC will be added later)
+        let mut fock = Matrix::zeros(nao, nao);
+        for i in 0..nao {
+            for j_idx in 0..nao {
+                let idx = i * nao + j_idx;
+                fock.data[idx] = kinetic.data[idx]
+                    + v_nuc.data[idx]
+                    + j.data[idx]
+                    - k.data[idx];
+            }
+        }
+
+        Ok((fock, overlap))
+    }
+}
+
+impl std::fmt::Debug for ScfResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScfResult")
+            .field("converged", &self.converged)
+            .field("nao", &self.nao)
+            .field("kmesh", &self.kmesh)
+            .field("kpoints_len", &self.kpoints.len())
+            .field("fermi_level", &self.fermi_level)
+            .finish()
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
