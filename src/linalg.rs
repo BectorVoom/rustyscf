@@ -7,6 +7,7 @@ use crate::error::Error;
 use nalgebra::{Cholesky, DMatrix, SymmetricEigen};
 
 /// Dense column-major matrix wrapper (f64).
+/// All data vectors are interpreted as column-major (row + col * nrow).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Matrix {
     pub nrow: usize,
@@ -39,6 +40,7 @@ impl Matrix {
         DMatrix::from_column_slice(self.nrow, self.ncol, &self.data)
     }
 
+    #[allow(dead_code)]
     fn from_dmatrix(m: DMatrix<f64>) -> Self {
         Self {
             nrow: m.nrows(),

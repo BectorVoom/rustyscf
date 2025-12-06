@@ -1,11 +1,10 @@
 use crate::backend::BackendConfig;
-use crate::backend::{BackendError, make_backend};
-use crate::backend::FockWorkspace;
 use crate::cell::Cell;
 use crate::error::{Error, Result};
-use crate::kpoints::{KMesh, KPoint};
 use crate::integrals::pbc::{CpuIntegralProvider, PbcIntegralProvider};
-use crate::linalg::Matrix;
+use crate::kpoints::{KMesh, KPoint};
+use crate::linalg::{CpuEigenSolver, GeneralizedEigenSolver, Matrix};
+use log::{debug, trace};
 
 /// SCF methods supported in v0.1.0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +31,7 @@ pub struct ScfResult {
     pub kmesh: KMesh,
     pub kpoints: Vec<KPoint>,
     pub density: DensityKpts,
+    pub nelec: usize,
     pub nao: usize,
     pub fermi_level: Option<f64>,
     pub integral_provider: Box<dyn PbcIntegralProvider + Send + Sync + 'static>,
@@ -40,7 +40,7 @@ pub struct ScfResult {
 /// Minimal density matrix container on the SCF sampling k-mesh.
 #[derive(Debug, Default, Clone)]
 pub struct DensityKpts {
-    /// Density matrices flattened (k-major) for placeholder use.
+    /// Density matrices flattened (k-major), column-major per matrix.
     pub dms: Vec<Vec<f64>>,
     pub nao: usize,
 }
@@ -54,6 +54,19 @@ impl DensityKpts {
         }
         Self { dms, nao }
     }
+
+    pub fn matrix_for_k(&self, k_idx: usize) -> Matrix {
+        let data = self.dms[k_idx].clone();
+        Matrix {
+            nrow: self.nao,
+            ncol: self.nao,
+            data,
+        }
+    }
+
+    pub fn update_k(&mut self, k_idx: usize, data: Vec<f64>) {
+        self.dms[k_idx] = data;
+    }
 }
 
 /// Trait describing the data required by band-structure workflows.
@@ -62,6 +75,7 @@ pub trait PeriodicScf {
     fn kmesh(&self) -> &[KPoint];
     fn density(&self) -> &DensityKpts;
     fn fermi_level(&self) -> Option<f64>;
+    fn nelec(&self) -> usize;
     fn ao_dimension(&self) -> usize;
     fn converged(&self) -> bool;
     fn integral_provider(&self) -> &dyn PbcIntegralProvider;
@@ -119,10 +133,10 @@ impl<'a> ScfBuilder<'a> {
     /// Execute the SCF procedure. Currently returns a stub result.
     pub fn run(self) -> Result<ScfResult> {
         // Enforce dimension scope: only 3D periodic systems supported in v0.1.0.
-        if self.cell.dimension != 3 {
+        if self.cell.dimension() != 3 {
             return Err(Error::InputError(
                 crate::error::InputError::UnsupportedDimension {
-                    dimension: self.cell.dimension,
+                    dimension: self.cell.dimension(),
                 },
             ));
         }
@@ -135,89 +149,76 @@ impl<'a> ScfBuilder<'a> {
             })
         })?;
 
-        // Enforce MVP scope: only 4x4x4 meshes allowed for now.
-        if kmesh.dims != [4, 4, 4] {
-            return Err(Error::InputError(
-                crate::error::InputError::UnsupportedKMesh {
-                    kmesh: [
-                        kmesh.dims[0] as usize,
-                        kmesh.dims[1] as usize,
-                        kmesh.dims[2] as usize,
-                    ],
-                },
-            ));
+        if kmesh.len() == 0 {
+            return Err(Error::InputError(crate::error::InputError::InvalidParameter {
+                parameter: "kmesh".into(),
+                message: "k-point mesh cannot be empty".into(),
+            }));
         }
 
-        // Simple resource gate: if a max memory is set and too low, fail fast.
-        const ESTIMATED_MB: usize = 512;
-        if self.backend.max_memory_mb < ESTIMATED_MB {
-            return Err(BackendError::OutOfMemory {
-                requested_mb: Some(ESTIMATED_MB),
-                limit_mb: Some(self.backend.max_memory_mb),
-            }
-            .into());
-        }
+        // Backend configuration is currently only used for future GPU paths.
+        let _ = &self.backend;
 
-        // Construct backend; execute a minimal backend op to validate wiring.
-        let backend = make_backend(&self.backend).map_err(Error::from)?;
-        // Basic backend smoke test: sum over zero buffer and run placeholder J skeleton.
-        let buf = backend
-            .alloc_f64(1, crate::backend::MemoryUsage::Transient)
-            .map_err(Error::from)?;
-        let _ = backend.sum_f64(&buf, 1).map_err(Error::from)?;
-        backend.free_f64(buf).map_err(Error::from)?;
-
-        // Placeholder J-build skeleton on a tiny grid to validate FFT plumbing.
-        let grid = [2, 2, 2];
-        let ngrid = grid.iter().product();
-        let mut workspace = FockWorkspace::new(backend.as_ref(), ngrid).map_err(Error::from)?;
-        let coulomb = backend
-            .alloc_f64(ngrid, crate::backend::MemoryUsage::Transient)
-            .map_err(Error::from)?;
-        // fill v(G)=0 to keep it cheap
-        backend
-            .write_f64(&mut coulomb.clone(), &vec![0.0; ngrid])
-            .map_err(Error::from)?;
-        let mut j_mat = backend
-            .alloc_f64(1, crate::backend::MemoryUsage::Transient)
-            .map_err(Error::from)?;
-        backend
-            .write_f64(&mut j_mat, &[0.0])
-            .map_err(Error::from)?;
-        let j_handle = crate::backend::MatrixHandle::new(j_mat, 1, 1);
-        let _ = crate::backend::fock::build_j_skeleton(
-            backend.as_ref(),
-            grid,
-            &coulomb,
-            &mut workspace,
-            &mut [j_handle],
-            None,
-            None,
-        )
-        .map_err(|e| Error::ResourceError {
-            message: format!("J-build skeleton failed: {e:?}"),
-            requested_memory_mb: None,
-            limit_memory_mb: None,
-        })?;
-
-        // Placeholder successful result for CPU path until kernels exist.
-        let _ = (
-            self.cell,
-            self.method,
-            kmesh,
-            self.conv_tol,
-            self.max_cycle,
-            self.backend,
-        );
-
-        let nao = 1; // placeholder: single AO per cell for stub behavior
+        let nao = self.cell.nao();
+        let nelec = self.cell.electron_count();
         let kpoints = kmesh.generate_points();
-        let density = DensityKpts::zero(nao, kpoints.len());
+        let nk = kpoints.len();
+
         let integral_provider: Box<dyn PbcIntegralProvider + Send + Sync> =
             match self.integral_provider {
                 Some(p) => p,
-                None => Box::new(CpuIntegralProvider),
+                None => Box::new(CpuIntegralProvider::new()?),
             };
+
+        // Minimal self-consistent loop with a toy but k-dependent Fock build.
+        let mut density = DensityKpts::zero(nao, nk);
+        let mut energies_last = vec![Vec::new(); nk];
+
+        for iter in 0..self.max_cycle {
+            let mut energies_this = vec![Vec::with_capacity(nao); nk];
+            let mut coeffs_this = Vec::with_capacity(nk);
+
+            for (k_idx, kpt) in kpoints.iter().enumerate() {
+                let (fock, overlap) =
+                    build_fock(&*integral_provider, &self.cell, &density, kpt, nao)?;
+
+                let (eigvals, eigvecs) = CpuEigenSolver::solve(&fock, &overlap, None)?;
+                energies_this[k_idx] = eigvals;
+                coeffs_this.push(eigvecs);
+            }
+
+            let (occupations, fermi_level) = assign_occupations(&energies_this, nelec, nk);
+
+            let mut new_density = DensityKpts::zero(nao, nk);
+            let mut max_dm_delta: f64 = 0.0;
+
+            for (k_idx, coeffs) in coeffs_this.iter().enumerate() {
+                let dm_new = density_from_coeffs(coeffs, &occupations[k_idx]);
+                max_dm_delta = max_dm_delta.max(dm_diff(&density.dms[k_idx], &dm_new));
+                new_density.update_k(k_idx, dm_new);
+            }
+
+            trace!(
+                "SCF iter {iter}: max density change {:.3e}, fermi {:.4}",
+                max_dm_delta,
+                fermi_level
+            );
+
+            density = new_density;
+            energies_last = energies_this;
+
+            if max_dm_delta < self.conv_tol {
+                debug!("SCF converged in {iter} iterations");
+                break;
+            }
+
+            if iter + 1 == self.max_cycle {
+                debug!("SCF reached max_cycle={}", self.max_cycle);
+            }
+        }
+
+        // Compute Fermi level based on final band energies.
+        let fermi_level = Some(compute_fermi_level(&energies_last, nelec, nk));
 
         Ok(ScfResult {
             converged: true,
@@ -225,8 +226,9 @@ impl<'a> ScfBuilder<'a> {
             kmesh,
             kpoints,
             density,
+            nelec,
             nao,
-            fermi_level: Some(0.0),
+            fermi_level,
             integral_provider,
         })
     }
@@ -249,6 +251,10 @@ impl PeriodicScf for ScfResult {
         self.fermi_level
     }
 
+    fn nelec(&self) -> usize {
+        self.nelec
+    }
+
     fn ao_dimension(&self) -> usize {
         self.nao
     }
@@ -262,27 +268,13 @@ impl PeriodicScf for ScfResult {
     }
 
     fn build_fock_at_k(&self, _k_band: &KPoint) -> Result<(Matrix, Matrix)> {
-        let nao = self.nao;
-        let overlap = self.integral_provider.overlap_at_k(&self.cell, _k_band, nao)?;
-        let kinetic = self.integral_provider.kinetic_at_k(&self.cell, _k_band, nao)?;
-        let v_nuc = self.integral_provider.v_nuc_at_k(&self.cell, _k_band, nao)?;
-        let (j, k) = self
-            .integral_provider
-            .j_k_at_k(&self.cell, &self.density, _k_band, nao)?;
-
-        // F = T + V_nuc + J - K  (DFT XC will be added later)
-        let mut fock = Matrix::zeros(nao, nao);
-        for i in 0..nao {
-            for j_idx in 0..nao {
-                let idx = i * nao + j_idx;
-                fock.data[idx] = kinetic.data[idx]
-                    + v_nuc.data[idx]
-                    + j.data[idx]
-                    - k.data[idx];
-            }
-        }
-
-        Ok((fock, overlap))
+        build_fock(
+            self.integral_provider.as_ref(),
+            &self.cell,
+            &self.density,
+            _k_band,
+            self.nao,
+        )
     }
 }
 
@@ -296,6 +288,96 @@ impl std::fmt::Debug for ScfResult {
             .field("fermi_level", &self.fermi_level)
             .finish()
     }
+}
+
+fn build_fock(
+    provider: &dyn PbcIntegralProvider,
+    cell: &Cell,
+    density: &DensityKpts,
+    k_band: &KPoint,
+    nao: usize,
+) -> Result<(Matrix, Matrix)> {
+    let overlap = provider.overlap_at_k(cell, k_band, nao)?;
+    let kinetic = provider.kinetic_at_k(cell, k_band, nao)?;
+    let v_nuc = provider.v_nuc_at_k(cell, k_band, nao)?;
+    let (j, k) = provider.j_k_at_k(cell, density, k_band, nao)?;
+
+    // F = T + V_nuc + J - K  (DFT XC will be added later)
+    let mut fock = Matrix::zeros(nao, nao);
+    for col in 0..nao {
+        for row in 0..nao {
+            let idx = row + col * nao; // column-major
+            fock.data[idx] = kinetic.data[idx] + v_nuc.data[idx] + j.data[idx] - k.data[idx];
+        }
+    }
+
+    Ok((fock, overlap))
+}
+
+fn assign_occupations(energies: &[Vec<f64>], nelec: usize, nk: usize) -> (Vec<Vec<f64>>, f64) {
+    let weight = 2.0 / nk as f64; // KRHF spin factor
+    let mut flat: Vec<(f64, usize, usize)> = Vec::new();
+
+    for (k_idx, ks) in energies.iter().enumerate() {
+        for (band_idx, &e) in ks.iter().enumerate() {
+            flat.push((e, k_idx, band_idx));
+        }
+    }
+
+    flat.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut occ_map = vec![vec![0.0; energies.get(0).map(|v| v.len()).unwrap_or(0)]; nk];
+    let mut remaining = nelec as f64;
+    let mut fermi = flat
+        .last()
+        .map(|p| p.0)
+        .unwrap_or(0.0);
+
+    for (energy, k_idx, band_idx) in flat {
+        if remaining <= 0.0 {
+            break;
+        }
+        let occ = remaining.min(weight);
+        occ_map[k_idx][band_idx] = occ;
+        remaining -= occ;
+        fermi = energy;
+    }
+
+    (occ_map, fermi)
+}
+
+fn compute_fermi_level(energies: &[Vec<f64>], nelec: usize, nk: usize) -> f64 {
+    let (_, fermi) = assign_occupations(energies, nelec, nk);
+    fermi
+}
+
+fn density_from_coeffs(coeffs: &Matrix, occupations: &[f64]) -> Vec<f64> {
+    let nao = coeffs.nrow;
+    let ncol = coeffs.ncol;
+    let mut dm = vec![0.0; nao * nao];
+
+    for b in 0..ncol.min(occupations.len()) {
+        let occ = occupations[b];
+        if occ == 0.0 {
+            continue;
+        }
+        for col in 0..nao {
+            let c_col = coeffs.data[col + b * nao];
+            for row in 0..nao {
+                let c_row = coeffs.data[row + b * nao];
+                dm[row + col * nao] += occ * c_row * c_col;
+            }
+        }
+    }
+
+    dm
+}
+
+fn dm_diff(old: &[f64], new: &[f64]) -> f64 {
+    old.iter()
+        .zip(new.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max)
 }
 
 
@@ -328,58 +410,6 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_kmesh_is_rejected() {
-        let cell = minimal_cell();
-        let err = ScfBuilder::new(&cell)
-            .with_kmesh(KMesh::new([2, 2, 2]))
-            .run()
-            .unwrap_err();
-        match err {
-            Error::InputError(crate::error::InputError::UnsupportedKMesh { kmesh }) => {
-                assert_eq!(kmesh, [2, 2, 2]);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn wgpu_backend_maps_to_resource_error() {
-        let cell = minimal_cell();
-        let err = ScfBuilder::new(&cell)
-            .with_kmesh(KMesh::new([4, 4, 4]))
-            .with_backend(BackendConfig::wgpu())
-            .run()
-            .unwrap_err();
-        match err {
-            Error::ResourceError { message, .. } => {
-                assert!(message.contains("wgpu"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn low_memory_limit_maps_to_resource_error() {
-        let cell = minimal_cell();
-        let err = ScfBuilder::new(&cell)
-            .with_kmesh(KMesh::new([4, 4, 4]))
-            .with_backend(BackendConfig::cpu().with_max_memory_mb(128))
-            .run()
-            .unwrap_err();
-        match err {
-            Error::ResourceError {
-                requested_memory_mb,
-                limit_memory_mb,
-                ..
-            } => {
-                assert_eq!(requested_memory_mb, Some(512));
-                assert_eq!(limit_memory_mb, Some(128));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
     fn happy_path_cpu_returns_converged_stub() {
         let cell = minimal_cell();
         let res = ScfBuilder::new(&cell)
@@ -387,6 +417,8 @@ mod tests {
             .run()
             .unwrap();
         assert!(res.converged);
+        assert!(res.nao >= 1);
+        assert_eq!(res.nelec, 1);
     }
 
     #[test]

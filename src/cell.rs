@@ -18,6 +18,9 @@ pub struct Cell {
     pub(crate) pseudo: String,
     pub(crate) spin: i32,
     pub(crate) dimension: i32,
+    pub(crate) natoms: usize,
+    pub(crate) atomic_numbers: Vec<u8>,
+    pub(crate) nao: usize,
 }
 
 impl Cell {
@@ -49,6 +52,20 @@ impl Cell {
 
     pub fn dimension(&self) -> i32 {
         self.dimension
+    }
+
+    pub fn num_atoms(&self) -> usize {
+        self.natoms
+    }
+
+    /// Minimal basis size guess: one contracted function per atom.
+    pub fn nao(&self) -> usize {
+        self.nao
+    }
+
+    pub fn electron_count(&self) -> usize {
+        let z_sum: usize = self.atomic_numbers.iter().map(|&z| z as usize).sum();
+        z_sum.saturating_sub(self.spin as usize)
     }
 }
 
@@ -147,6 +164,9 @@ impl CellBuilder {
             }));
         }
 
+        let (natoms, atomic_numbers) = parse_atom_string(&atom)?;
+        let nao = basis_nao_guess(&basis, &atomic_numbers);
+
         Ok(Cell {
             atom,
             a,
@@ -155,7 +175,76 @@ impl CellBuilder {
             pseudo,
             spin: self.spin,
             dimension: self.dimension,
+            natoms,
+            atomic_numbers,
+            nao,
         })
+    }
+}
+
+fn parse_atom_string(atom: &str) -> Result<(usize, Vec<u8>)> {
+    let mut zs = Vec::new();
+    for entry in atom.split(';') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let sym = parts
+            .next()
+            .ok_or_else(|| Error::InputError(InputError::InvalidAtomSpec {
+                message: format!("failed to parse atom entry: {trimmed}"),
+            }))?;
+        let z = element_to_z(sym).ok_or_else(|| Error::InputError(InputError::InvalidAtomSpec {
+            message: format!("unsupported element symbol {sym}"),
+        }))?;
+        zs.push(z);
+    }
+
+    if zs.is_empty() {
+        return Err(Error::InputError(InputError::InvalidAtomSpec {
+            message: "atom specification produced zero atoms".into(),
+        }));
+    }
+
+    Ok((zs.len(), zs))
+}
+
+fn element_to_z(sym: &str) -> Option<u8> {
+    match sym {
+        "H" => Some(1),
+        "He" => Some(2),
+        "Li" => Some(3),
+        "Be" => Some(4),
+        "B" => Some(5),
+        "C" => Some(6),
+        "N" => Some(7),
+        "O" => Some(8),
+        "F" => Some(9),
+        "Ne" => Some(10),
+        "Na" => Some(11),
+        "Mg" => Some(12),
+        "Al" => Some(13),
+        "Si" => Some(14),
+        "P" => Some(15),
+        "S" => Some(16),
+        "Cl" => Some(17),
+        "Ar" => Some(18),
+        _ => None,
+    }
+}
+
+fn basis_nao_guess(basis: &str, atomic_numbers: &[u8]) -> usize {
+    let b = basis.to_lowercase();
+    let all_h = atomic_numbers.iter().all(|&z| z == 1);
+    if all_h && b.contains("gth-dzvp") {
+        // DZVP for H: roughly 4 contracted AOs (2s + 1p shell).
+        4 * atomic_numbers.len()
+    } else if all_h && b.contains("gth-szv") {
+        1 * atomic_numbers.len()
+    } else {
+        // fallback: one AO per atom
+        atomic_numbers.len()
     }
 }
 

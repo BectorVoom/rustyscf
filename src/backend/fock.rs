@@ -205,7 +205,7 @@ fn project_j(
                         for g in 0..ngrid {
                             acc += v_re[g] * ao_vals[ao_mu_off + g] * ao_vals[ao_nu_off + g];
                         }
-                        j_host[mu * nao + nu] = acc;
+                        j_host[mu * nao + nu] = acc / ngrid as f64;
                     }
                 }
                 backend.write_f64(&mut j.buffer, &j_host)?;

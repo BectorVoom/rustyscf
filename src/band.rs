@@ -155,18 +155,20 @@ impl<'a> BandStructureBuilder<'a> {
             }
         }
 
-        let nk = kpoints.len();
+        let (occupations, fermi_level) = if self.with_occupations || self.scf.fermi_level().is_none() {
+            let (occ, f) =
+                assign_band_occupations(&energies, self.scf.nelec(), kpoints.len());
+            (Some(occ), Some(f))
+        } else {
+            (None, self.scf.fermi_level())
+        };
 
         Ok(BandStructureResult {
             kpoints,
             energies,
-            occupations: if self.with_occupations {
-                Some(vec![vec![0.0; self.n_bands.unwrap_or(self.scf.ao_dimension())]; nk])
-            } else {
-                None
-            },
+            occupations: if self.with_occupations { occupations } else { None },
             mo_coeff: coeffs,
-            fermi_level: self.scf.fermi_level(),
+            fermi_level: fermi_level.or(self.scf.fermi_level()),
         })
     }
 
@@ -192,6 +194,33 @@ impl BandStructureResult {
     }
 }
 
+fn assign_band_occupations(energies: &[Vec<f64>], nelec: usize, nk: usize) -> (Vec<Vec<f64>>, f64) {
+    let weight = 2.0 / nk as f64;
+    let mut flat = Vec::new();
+    for (k_idx, row) in energies.iter().enumerate() {
+        for (band_idx, &e) in row.iter().enumerate() {
+            flat.push((e, k_idx, band_idx));
+        }
+    }
+    flat.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut occ = vec![vec![0.0; energies.get(0).map(|r| r.len()).unwrap_or(0)]; nk];
+    let mut remaining = nelec as f64;
+    let mut fermi = flat.last().map(|p| p.0).unwrap_or(0.0);
+
+    for (e, k_idx, band_idx) in flat {
+        if remaining <= 0.0 {
+            break;
+        }
+        let o = remaining.min(weight);
+        occ[k_idx][band_idx] = o;
+        remaining -= o;
+        fermi = e;
+    }
+
+    (occ, fermi)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn band_builder_returns_placeholder_zero_band() {
+    fn band_builder_returns_nontrivial_band() {
         let cell = minimal_cell();
         let scf = ScfBuilder::new(&cell)
             .with_method(Method::KRHF)
@@ -236,7 +265,11 @@ mod tests {
         assert!(bands
             .energies()
             .iter()
-            .all(|row| row.len() == 1 && row[0] == 0.0));
+            .all(|row| row.len() == scf.ao_dimension()));
+        // Should now yield a non-trivial dispersion along the path (first band).
+        let energy_gamma = bands.energies[0][0];
+        let energy_x = bands.energies.last().unwrap()[0];
+        assert_ne!(energy_gamma, energy_x);
     }
 
     #[test]
